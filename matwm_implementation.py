@@ -93,11 +93,12 @@ class MATWMConfig:
     
     # Gradient Clipping (Table C.6)
     gradient_clip_wm: float = 1000.0  # Gradient clipping world model
-    gradient_clip_agent: float = 100.0  # Gradient clipping agent
+    gradient_clip_agent: float = 10.0  # ★ FIX: 100→10 (Critic スパイク防止)
     
     # RL Parameters
     gamma: float = 0.99  # Discount factor
     lambda_gae: float = 0.95  # GAE lambda
+    entropy_coef: float = 0.01  # ★ NEW: エントロピーボーナス係数（探索促進）
     
     # Replay Buffer (Table C.6)
     buffer_size: int = 50000  # Replay buffer size (will be adjusted in __post_init__)
