@@ -22,6 +22,16 @@ from matwm_implementation import (
 class MATWMAgent:
     """Complete MATWM Agent with World Model and Actor-Critic"""
     
+    # エージェント名→インデックスの静的マッピング（simple_tag_v3 用）
+    # store_experience では other_actions が {agent_name: action} 形式で保存されるが、
+    # TeammatePredictor は {agent_idx: logits} で返すため、変換が必要。
+    AGENT_NAME_TO_IDX = {
+        'adversary_0': 0,
+        'adversary_1': 1,
+        'adversary_2': 2,
+        'agent_0': 3,
+    }
+    
     def __init__(self, config, agent_name, agent_idx, device, shared_world_model=None):
         self.config = config
         self.agent_name = agent_name
@@ -246,6 +256,9 @@ class MATWMAgent:
         cont_loss = F.binary_cross_entropy_with_logits(cont_logits, cont_target)
         
         # Teammate prediction loss
+        # ★ FIX: other_actions は {agent_name(str): action} 形式で保存されているが、
+        # predict_teammates は {agent_idx(int): logits} を返す。
+        # agent_name → agent_idx への変換が必要。
         teammate_loss = 0.0
         count = 0
         
@@ -257,8 +270,15 @@ class MATWMAgent:
             
             for t in range(config.wm_batch_length):
                 if other_actions_batch[seq_idx][t] is not None:
+                    # agent_name → agent_idx に変換してからマッチング
+                    other_actions_by_idx = {}
+                    for aname, aact in other_actions_batch[seq_idx][t].items():
+                        aidx = MATWMAgent.AGENT_NAME_TO_IDX.get(aname)
+                        if aidx is not None:
+                            other_actions_by_idx[aidx] = aact
+                    
                     for other_agent_idx, logits in teammate_logits_dict.items():
-                        other_action = other_actions_batch[seq_idx][t].get(other_agent_idx)
+                        other_action = other_actions_by_idx.get(other_agent_idx)
                         if other_action is not None:
                             target = torch.LongTensor([other_action]).to(device)
                             teammate_loss += F.cross_entropy(
@@ -369,6 +389,7 @@ class MATWMAgent:
         cont_loss = F.binary_cross_entropy_with_logits(cont_logits, cont_target)
         
         # Teammate prediction loss
+        # ★ FIX: agent_name(str) → agent_idx(int) 変換
         teammate_logits_dict = self.world_model.predict_teammates(z, self.agent_idx)
         teammate_loss = 0.0
         count = 0
@@ -376,8 +397,15 @@ class MATWMAgent:
         for batch_idx in range(len(other_actions_batch)):
             for t in range(self.config.wm_batch_length):
                 if other_actions_batch[batch_idx][t] is not None:
+                    # agent_name → agent_idx に変換
+                    other_actions_by_idx = {}
+                    for aname, aact in other_actions_batch[batch_idx][t].items():
+                        aidx = MATWMAgent.AGENT_NAME_TO_IDX.get(aname)
+                        if aidx is not None:
+                            other_actions_by_idx[aidx] = aact
+                    
                     for other_agent_idx, logits in teammate_logits_dict.items():
-                        other_action = other_actions_batch[batch_idx][t].get(other_agent_idx)
+                        other_action = other_actions_by_idx.get(other_agent_idx)
                         if other_action is not None:
                             target = torch.LongTensor([other_action]).to(self.device)
                             teammate_loss += F.cross_entropy(
@@ -425,7 +453,15 @@ class MATWMAgent:
         }
     
     def train_agent(self):
-        """Train actor-critic with imagination"""
+        """
+        Train actor-critic with imagination.
+        
+        ★ FIX: 
+          - Critic loss: MSE → Huber loss（スパイク防止）
+          - returns をクリップ（発散防止）
+          - advantages を正規化（学習安定化）
+          - Actor loss にエントロピーボーナス追加（探索促進）
+        """
         sequences = self.replay_buffer.sample_random(
             self.config.agent_batch_size, 1  # Sample single starting states
         )
@@ -445,6 +481,7 @@ class MATWMAgent:
         reward_trajectory = []
         value_trajectory = []
         action_log_prob_trajectory = []
+        entropy_trajectory = []          # ★ エントロピー追加
         continuation_trajectory = []
         
         z_current = z
@@ -454,6 +491,7 @@ class MATWMAgent:
             action_dist = torch.distributions.Categorical(logits=action_logits)
             action = action_dist.sample()
             action_log_prob = action_dist.log_prob(action)
+            entropy = action_dist.entropy()  # ★ エントロピー
             
             # Scale action
             scaled_action = action + self.agent_idx * self.config.action_dim
@@ -480,6 +518,7 @@ class MATWMAgent:
             reward_trajectory.append(reward)
             value_trajectory.append(value)
             action_log_prob_trajectory.append(action_log_prob)
+            entropy_trajectory.append(entropy)  # ★
             continuation_trajectory.append(continuation)
             
             z_current = z_next.detach()
@@ -503,15 +542,26 @@ class MATWMAgent:
             advantages.insert(0, gae)
         advantages = torch.stack(advantages, dim=1)
         
+        # ★ FIX: advantages を正規化（学習安定化）
+        adv_mean = advantages.mean()
+        adv_std = advantages.std() + 1e-8
+        advantages_norm = (advantages - adv_mean) / adv_std
+        
         # Returns
         returns = advantages + torch.stack(value_trajectory, dim=1)
+        # ★ FIX: returns をクリップ（Critic の発散防止）
+        returns = torch.clamp(returns, -100.0, 100.0)
         
-        # Actor loss (policy gradient)
+        # Actor loss (policy gradient + entropy bonus)
         action_log_probs = torch.stack(action_log_prob_trajectory, dim=1)
-        actor_loss = -(action_log_probs * advantages.detach()).mean()
+        entropies = torch.stack(entropy_trajectory, dim=1)
+        entropy_coef = 0.01  # ★ エントロピーボーナス係数
+        actor_loss = -(action_log_probs * advantages_norm.detach()).mean() - entropy_coef * entropies.mean()
         
-        # Critic loss
-        critic_loss = F.mse_loss(torch.stack(value_trajectory, dim=1), returns.detach())
+        # ★ FIX: Critic loss を Huber loss に変更（スパイク防止）
+        critic_loss = F.smooth_l1_loss(
+            torch.stack(value_trajectory, dim=1), returns.detach()
+        )
         
         # Update actor
         self.actor_optimizer.zero_grad()
@@ -530,6 +580,8 @@ class MATWMAgent:
             'critic_loss': critic_loss.item(),
             'mean_imagined_reward': rewards.mean().item(),
             'mean_value': values.mean().item(),
+            'mean_entropy': entropies.mean().item(),       # ★ 新メトリクス
+            'mean_advantage': advantages.mean().item(),     # ★ 新メトリクス
         }
     
     def save(self, path):
